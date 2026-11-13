@@ -181,9 +181,12 @@ details .f{margin-top:12px}
       <div class="f">
         <label class="fld">水平FOV（16:9基準）<input id="fov" type="number" min="60" max="130"></label>
         <label class="fld">音量<input id="vol" type="range" min="0" max="1" step="0.05"></label>
-        <label class="fld">パッド感度<input id="padsens" type="range" min="60" max="600" step="10"></label>
+        <label class="fld">パッド感度（Apex基準・リニア）<input id="padsens" type="number" min="0.5" max="20" step="0.1"></label>
         <label class="fld" style="flex:0">クロスヘア<input id="xhc" type="color"></label>
       </div>
+      <div id="padcm" style="color:var(--dim);font-size:.85rem;margin-top:6px"></div>
+      <div class="f"><button id="hidbtn">コントローラーを選ぶ</button><span id="hidst" class="sub"></span></div>
+      <div class="f" id="hidmap" hidden><button id="hm-ax">視点</button><button id="hm-fire">射撃</button><button id="hm-ok">決定</button><button id="hm-pause">ポーズ</button></div>
       <div class="f"><label><input id="fs" type="checkbox"> プレイ開始時にフルスクリーンにする（描画の遅延が減ります）</label></div>
     </details>
     <button id="leave">退出</button>
@@ -201,8 +204,9 @@ const TYPES={n:{c:0xffa62b,score:100},z:{c:0x3ec5ff,score:150},s:{c:0xff4d8d,sco
 const $=id=>document.getElementById(id);
 
 /* ================= settings ================= */
-const cfg={name:'',preset:'0.022',sens:1.5,dpi:800,fov:103,vol:0.5,xh:'#ffffff',fs:true,padsens:240};
+const cfg={name:'',preset:'0.022',sens:1.5,dpi:800,fov:103,vol:0.5,xh:'#ffffff',fs:true,padsens:4,hid:{},hidlast:''};
 try{Object.assign(cfg,JSON.parse(localStorage.getItem('outbound-cfg2')||'{}'))}catch(e){}
+if(!(cfg.padsens>=0.5&&cfg.padsens<=20))cfg.padsens=4; // older saves used a degrees/second slider
 if(!cfg.name)cfg.name='Player'+Math.floor(Math.random()*900+100);
 function saveCfg(){try{localStorage.setItem('outbound-cfg2',JSON.stringify(cfg))}catch(e){}}
 
@@ -240,7 +244,10 @@ const sphereGeo=new THREE.SphereGeometry(1,28,18),ringGeo=new THREE.RingGeometry
 const cBase=new THREE.Color(0x6f9bff),cRed=new THREE.Color(0xff2a3c),cTmp=new THREE.Color();
 let frameFlash=-1e9;
 function resize(){renderer.setSize(innerWidth,innerHeight,false);camera.aspect=innerWidth/innerHeight;
-  camera.fov=2*Math.atan(Math.tan(cfg.fov*Math.PI/360)*9/16)*180/Math.PI;camera.updateProjectionMatrix()}
+  camera.fov=2*Math.atan(Math.tan(cfg.fov*Math.PI/360)*9/16)*180/Math.PI;camera.updateProjectionMatrix();updPadCm()}
+// pad sensitivity is entered on an Apex-style scale; linear response (full stick = sens x PAD_K degrees/second). PAD_K is an estimate: calibrate it by timing a 360 turn at full tilt in Apex.
+const PAD_K=60,PAD_DZ=0.15;
+function updPadCm(){const el=document.getElementById('padcm');if(!el)return;const d=cfg.padsens*PAD_K;el.textContent='パッド: 最大 '+d.toFixed(0)+'°/秒（360°まで '+(360/d).toFixed(2)+' 秒）'}
 addEventListener('resize',resize);
 
 /* ================= targets ================= */
@@ -532,7 +539,61 @@ function pick(){
 /* ================= gamepad ================= */
 // Standard-mapping pad: right stick = aim, RT/LT/RB/LB = fire (one press = one click), A = confirm / resume, Start or B = pause (settings)
 let padOn=false,padFire=false,padPrev={};
-function getPad(){let best=null;for(const g of (navigator.getGamepads?navigator.getGamepads():[])){if(!g||!g.connected)continue;if(g.mapping==='standard')return g;if(!best&&g.axes.length>=4)best=g}return best}
+const connectedPads=()=>[...(navigator.getGamepads?navigator.getGamepads():[])].filter(g=>g&&g.connected);
+// A device picked through WebHID (the browser's own chooser) wins; otherwise the standard-mapping Gamepad API pad is used.
+function getPad(){if(HID.dev&&HID.map)return hidVirtual();
+  let best=null;for(const g of connectedPads()){if(g.mapping==='standard')return g;if(!best&&g.axes.length>=4)best=g}return best}
+
+/* ---- WebHID: any HID gamepad/joystick. The input layout is read from the device's report descriptor; the 4 roles are mapped once by pressing/tilting. ---- */
+const HID={dev:null,layout:null,key:'',map:null,vals:{},wait:null,msg:''};
+const HID_PROMPT={ax:'右スティックを左右に倒す',ay:'右スティックを上下に倒す',fire:'射撃ボタンを押す',ok:'決定ボタンを押す',pause:'ポーズボタンを押す'};
+// layout: reportId -> [{bit,size,page,usage,min,max}] for every non-constant input field, in descriptor order
+function hidBuildLayout(dev){const byRid=new Map();
+  const walk=cols=>{for(const c of cols){for(const r of c.inputReports||[]){let a=byRid.get(r.reportId);if(!a){a=[];byRid.set(r.reportId,a)}for(const it of r.items)a.push({it,col:c})}walk(c.children||[])}};
+  walk(dev.collections||[]);const layout=new Map();
+  for(const [rid,list] of byRid){let bit=0;const fields=[];
+    for(const {it,col} of list){const n=it.reportCount,sz=it.reportSize;
+      if(!it.isConstant)for(let i=0;i<n;i++){
+        const u=it.isRange?it.usageMinimum+i:it.usages[Math.min(i,it.usages.length-1)];
+        if(u!==undefined)fields.push({bit:bit+i*sz,size:sz,page:(u>>>16)||col.usagePage,usage:u&0xffff,min:it.logicalMinimum,max:it.logicalMaximum})}
+      bit+=n*sz}
+    layout.set(rid,fields)}
+  return layout}
+function hidBits(dv,bit,size){let v=0;for(let i=0;i<size;i++){const p=bit+i,by=p>>3;if(by>=dv.byteLength)break;if((dv.getUint8(by)>>(p&7))&1)v+=2**i}return v}
+function hidOnReport(e){const f=HID.layout&&HID.layout.get(e.reportId);if(!f)return;
+  for(const q of f){let v=hidBits(e.data,q.bit,q.size);if(q.min<0&&q.size<32&&v>=2**(q.size-1))v-=2**q.size;
+    if(q.page===9)HID.vals['b'+q.usage]=v?1:0;
+    else if((q.page===1&&q.usage>=0x30&&q.usage<=0x38)||q.page===2){const sp=q.max-q.min;HID.vals['a'+q.page+'_'+q.usage]=sp?((v-q.min)/sp)*2-1:0}}
+  if(HID.wait)hidCapture()}
+function hidCapture(){const w=HID.wait,v=HID.vals;let hit=null;
+  for(const k in v){const d=Math.abs(v[k]-(k in w.base?w.base[k]:v[k]));
+    if(w.step==='ax'||w.step==='ay'){if(k[0]==='a'&&d>0.6&&k!==w.skip){hit=k;break}}
+    else if(k[0]==='b'?(v[k]===1&&w.base[k]!==1):(d>0.6)){hit=k;break}}
+  if(!hit)return;
+  HID.map=Object.assign(HID.map||{},{[w.step]:hit});cfg.hid[HID.key]=HID.map;saveCfg();HID.wait=null;
+  if(w.step==='ax')hidStart('ay',hit);else hidStatus()}
+function hidStart(step,skip){HID.wait={step,base:Object.assign({},HID.vals),skip};hidStatus()}
+function hidVirtual(){const m=HID.map,v=HID.vals,on=k=>k&&(k[0]==='b'?v[k]===1:(v[k]===undefined?-1:v[k])>0.4);
+  const bt={0:on(m.ok),7:on(m.fire),9:on(m.pause)};
+  return {connected:true,axes:[0,0,v[m.ax]||0,v[m.ay]||0],buttons:Array.from({length:17},(_,i)=>({pressed:!!bt[i],value:bt[i]?1:0}))}}
+// Sony pads (DualShock 4 / DualSense) have a known layout on Windows; everything else is mapped by the user
+function hidDefaultMap(d){return d.vendorId===0x054c?{ax:'a1_50',ay:'a1_53',fire:'b8',ok:'b2',pause:'b10'}:null}
+function hidStatus(){const el=document.getElementById('hidst');if(!el)return;
+  document.getElementById('hidmap').hidden=!HID.dev;
+  el.textContent=HID.wait?HID_PROMPT[HID.wait.step]:HID.msg||(HID.dev?HID.dev.productName+(HID.map&&HID.map.ax&&HID.map.ay&&HID.map.fire?'':'（要設定）'):'未接続')}
+async function hidConnect(dev){
+  try{if(!dev.opened)await dev.open()}catch(e){HID.msg='接続できませんでした';hidStatus();return}
+  if(HID.dev&&HID.dev!==dev)HID.dev.removeEventListener('inputreport',hidOnReport);
+  HID.dev=dev;HID.layout=hidBuildLayout(dev);HID.key=dev.vendorId+':'+dev.productId;HID.vals={};HID.wait=null;HID.msg='';
+  HID.map=(cfg.hid&&cfg.hid[HID.key])||hidDefaultMap(dev);
+  dev.addEventListener('inputreport',hidOnReport);cfg.hidlast=HID.key;saveCfg();hidStatus()}
+async function hidInit(){const btn=document.getElementById('hidbtn');
+  if(!navigator.hid){btn.disabled=true;HID.msg='このブラウザは非対応';hidStatus();return}
+  btn.onclick=async()=>{try{const d=await navigator.hid.requestDevice({filters:[{usagePage:1,usage:5},{usagePage:1,usage:4}]});if(d[0])await hidConnect(d[0])}catch(e){HID.msg='選択できませんでした';hidStatus()}};
+  for(const s of ['ax','fire','ok','pause'])document.getElementById('hm-'+s).onclick=()=>hidStart(s);
+  navigator.hid.addEventListener('disconnect',e=>{if(e.device===HID.dev){HID.dev=null;HID.map=null;HID.vals={};HID.wait=null;hidStatus()}});
+  hidStatus();
+  try{const known=await navigator.hid.getDevices(),d=known.find(x=>(x.vendorId+':'+x.productId)===cfg.hidlast);if(d)await hidConnect(d)}catch(e){}}
 function padUpdate(dt){
   const g=getPad();if(!g){padFire=false;return}
   const st={},e={};for(const i of [0,1,4,5,6,7,9]){const b=g.buttons[i];st[i]=!!(b&&(b.pressed||b.value>0.5));e[i]=st[i]&&!padPrev[i]}padPrev=st;
@@ -547,8 +608,8 @@ function padUpdate(dt){
   if(!padOn&&!locked){padFire=false;if(anyE){padOn=true;refreshUI()}return}
   if(padOn&&!locked&&(e[9]||e[1])){padOn=true;paused=true;padFire=false;refreshUI();return}
   // aim: radial deadzone, squared response, degrees/second from the settings
-  let x=g.axes[2]||0,y=g.axes[3]||0;const m=Math.hypot(x,y),DZ=0.15;
-  if(m>DZ){const k=Math.pow((m-DZ)/(1-DZ),2)/m,sp=cfg.padsens*Math.PI/180;x*=k;y*=k;
+  let x=g.axes[2]||0,y=g.axes[3]||0;const m=Math.hypot(x,y),DZ=PAD_DZ;
+  if(m>DZ){const k=((m-DZ)/(1-DZ))/m,sp=cfg.padsens*PAD_K*Math.PI/180;x*=k;y*=k; // linear: output proportional to deflection past the deadzone
     yaw-=x*sp*dt;pitch=Math.max(-1.48,Math.min(1.48,pitch-y*sp*dt))}
   padFire=st[7]||st[6]||st[5]||st[4];
   if(e[7]||e[6]||e[5]||e[4])doClick()}
@@ -688,6 +749,7 @@ function syncSettings(){$('name').value=cfg.name;$('preset').value=cfg.preset;$(
 for(const [id,key,num] of [['preset','preset',0],['sens','sens',1],['dpi','dpi',1],['fov','fov',1],['vol','vol',1],['padsens','padsens',1],['xhc','xh',0]])
   $(id).addEventListener('input',e=>{let v=e.target.value;if(num){v=parseFloat(v);if(!(v>0)&&key!=='vol')return;if(key==='fov')v=Math.max(60,Math.min(130,v))}cfg[key]=v;saveCfg();
     $('xh').style.setProperty('--c',cfg.xh);const deg=cfg.sens*parseFloat(cfg.preset);$('cm').textContent='振り向き: 約 '+(360/(deg*cfg.dpi)*2.54).toFixed(1)+' cm / 360°';resize()});
+hidInit();
 $('fs').checked=!!cfg.fs;$('fs').addEventListener('change',e=>{cfg.fs=e.target.checked;saveCfg()});
 {const h=location.hash.replace('#','').toUpperCase();if(/^[A-Z0-9]{5}$/.test(h))$('joincode').value=h}
 
