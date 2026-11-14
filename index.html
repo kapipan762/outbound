@@ -539,10 +539,8 @@ function pick(){
 /* ================= gamepad ================= */
 // Standard-mapping pad: right stick = aim, RT/LT/RB/LB = fire (one press = one click), A = confirm / resume, Start or B = pause (settings)
 let padOn=false,padFire=false,padPrev={};
-const connectedPads=()=>[...(navigator.getGamepads?navigator.getGamepads():[])].filter(g=>g&&g.connected);
-// A device picked through WebHID (the browser's own chooser) wins; otherwise the standard-mapping Gamepad API pad is used.
-function getPad(){if(HID.dev&&HID.map)return hidVirtual();
-  let best=null;for(const g of connectedPads()){if(g.mapping==='standard')return g;if(!best&&g.axes.length>=4)best=g}return best}
+// Only a device the user picked through WebHID (the browser's own chooser) is read; nothing is picked up automatically.
+function getPad(){return HID.dev&&HID.map?hidVirtual():null}
 
 /* ---- WebHID: any HID gamepad/joystick. The input layout is read from the device's report descriptor; the 4 roles are mapped once by pressing/tilting. ---- */
 const HID={dev:null,layout:null,key:'',map:null,vals:{},wait:null,msg:''};
